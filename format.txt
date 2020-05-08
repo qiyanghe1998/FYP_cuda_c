@@ -1,0 +1,22 @@
+run parameter: dataset topk codebook Ks group top_norm batch_vecs batch_query threads_per_block
+
+file parameter:
+num_vecs num_dimen num_query
+quantization str e.g. NPPPNPPP
+
+each quantization nq or pq 
+print Ks codeword first nq one line, pq one vector one line
+then codebook both one line.
+
+next for the query
+query vector 
+threshold 
+candidate answer
+
+one floating number for the total time of this threshold
+
+last for the vecs
+each line for one vec: num_dimen
+
+
+
