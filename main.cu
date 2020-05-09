@@ -1,5 +1,6 @@
 #include "header.cuh"
 
+
 typedef float pq_float;
 typedef uint8_t pq_int;
 // configuration 
@@ -28,6 +29,7 @@ int num_vecs, num_dimen, num_query, num_q, top_norm;
 pq_float *vecs;
 pq_float *query;
 int *ret_result;
+int query_idx;
 
 int cal_2Dcoordinate(int x, int y, int leny) {
     return x * leny + y;
@@ -53,6 +55,36 @@ __global__ void calLookupOnGPU(pq_float *query, pq_float *codeword_nq, pq_float 
     }
 }
 
+void calLookupOnCPU(pq_float *query, pq_float *codeword_nq, pq_float *codeword_pq, pq_int *q_map, pq_float *lookup_table, 
+    int num_dimen, int num_q, int Ks) {
+    for (int i = 0; i < num_q; ++i) {
+        int q_type = q_map[2 * i];
+        int idx_q = q_map[2 * i + 1];
+        for (int j = 0; j < Ks; ++j) {
+            if (q_type == 0) {
+                lookup_table[cal_2Dcoordinate(i, j, Ks)] = codeword_nq[cal_2Dcoordinate(idx_q, j, Ks)];
+            } else if (q_type == 1) {
+                pq_float temp_sum = 0;
+                for (int k = 0; k < num_dimen; ++k) temp_sum += codeword_pq[cal_3Dcoordinate(idx_q, j, k, Ks, num_dimen)] * query[k];
+                lookup_table[cal_2Dcoordinate(i, j, Ks)] = temp_sum;
+            }
+        }
+    }
+}
+
+void checkLookup(pq_float *h_lookup_table, pq_float *gpuref_lookup_table, int length) {
+    double eps = 1e-7;
+    bool match = 1;
+    for (int i = 0; i < length; ++i) {
+        if (abs(h_lookup_table[i] - gpuref_lookup_table[i]) > eps) {
+            match = 0;
+            printf("Lookup tables do not match!\n");
+            printf("host %f gpu %f at current %d\n", h_lookup_table[i], gpuref_lookup_table[i], i);
+        }
+    }
+    if (match) printf("Lookup tables match.\n\n");
+}
+
 __global__ void calApproxVecs(int *mid_result, pq_int *codebook, pq_float *lookup_table, pq_int *q_map, int num_q, int Ks, int num_vecs,
     int start_vecs, int end_vecs, pq_float threshold) {
     int average_assign = num_q * Ks / blockDim.x;
@@ -68,25 +100,56 @@ __global__ void calApproxVecs(int *mid_result, pq_int *codebook, pq_float *looku
         for (int i = 0; i < num_q; ++i) {
             q_type = q_map[2 * i];
             if (q_type == 0) {
-                coefficient = lookup_table[i * Ks + codebook[i * num_vecs + (start_vecs + idx)]];
+                coefficient = local_lookup_table[i * Ks + codebook[i * num_vecs + (start_vecs + idx)]];
             } else if (q_type == 1) {
-                result += coefficient * lookup_table[i * Ks + codebook[i * num_vecs + (start_vecs + idx)]];
+                result += coefficient * local_lookup_table[i * Ks + codebook[i * num_vecs + (start_vecs + idx)]];
             }
         }
-        mid_result[idx] = result >= threshold;
+        if (result >= threshold) mid_result[idx] = 1;
+        else mid_result[idx] = 0;
+        // mid_result[idx] = result >= threshold;
     }
 }
 
-__global__ void assignResult(int *prefixsum_result, int *d_ret_result, int top_norm, int start_pos, int end_pos, int current_length) {
+void calMidResultOnCPU(int *mid_result, pq_int *codebook, pq_float *lookup_table, pq_int *q_map, int num_q, int Ks, int num_vecs, 
+    int start_pos, int end_pos, pq_float threshold) {
+    for (int i = 0; i < end_pos - start_pos; ++i) {
+        pq_float result = 0, mid_coefficient = 1;
+        for (int j = 0; j < num_q; ++j) {
+            int q_type = q_map[2 * j], idx = j * Ks + codebook[j * num_vecs + (start_pos + i)];
+            if (q_type == 0) {
+                mid_coefficient = lookup_table[idx];
+            } else if (q_type == 1) {
+                result += mid_coefficient * lookup_table[idx];
+            }
+        }
+        mid_result[i] = result > threshold;   
+    }
+}
+
+void checkMidResult(int *h_mid_result, int *gpuref_mid_result, int length) {
+    bool match = 1;
+    for (int i = 0; i < length; ++i) {
+        if (h_mid_result[i] != gpuref_mid_result[i]) {
+            match = 0;
+            printf("Mid results do not match!\n");
+            printf("host %d gpu %d at current %d\n", h_mid_result[i], gpuref_mid_result[i], i);
+            break;
+        }
+    }
+    if (match) printf("Mid results match.\n\n");
+}
+
+__global__ void assignResult(int *prefixsum_result, int *d_ret_result, int start_pos, int end_pos, int current_length) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (start_pos + idx < end_pos) {
         if (!idx) {
             if (prefixsum_result[idx] == 1) {
-                d_ret_result[current_length] = top_norm + start_pos + idx;
+                d_ret_result[current_length] = start_pos + idx;
             }
         } else {
             if (prefixsum_result[idx] - prefixsum_result[idx - 1]) {
-                d_ret_result[current_length + prefixsum_result[idx] - 1] = top_norm + start_pos + idx;
+                d_ret_result[current_length + prefixsum_result[idx] - 1] = start_pos + idx;
             }
         }
     }
@@ -97,16 +160,17 @@ __global__ void initResult(int *d_ret_result, int size_ret_result) {
     if (idx < size_ret_result) d_ret_result[idx] = 0;
 }
 
-float calNorm(pq_float *arr, int num_dimen) {
+float calNorm(pq_float *arr, int vecs_idx, int query_idx, int num_dimen) {
     pq_float temp_sum = 0;
+    int offset_vecs = vecs_idx * num_dimen, offset_query = query_idx * num_dimen;
     for (int i = 0; i < num_dimen; ++i) {
-        temp_sum += arr[i] * query[i];
+        temp_sum += arr[offset_vecs + i] * query[offset_query + i];
     }
     return temp_sum;
 }
 
-bool cmpIPIndex(const int &lhs, const int &rhs) {
-    return calNorm(vecs + lhs * num_dimen, num_dimen) > calNorm(vecs + rhs * num_dimen, num_dimen);
+bool cmpIPIndex(int lhs, int rhs) {
+    return calNorm(vecs, lhs, query_idx, num_dimen) > calNorm(vecs, rhs, query_idx, num_dimen);
 }
 
 int sameIndex(int *vecs1, int *vecs2, int number) {
@@ -177,7 +241,7 @@ int main(int argc, char *argv[]) {
     size_norm_filter = num_vecs / batch_vecs;
     size_q_map = num_q * 2;
     size_lookup_table = num_q * Ks;
-    size_ret_result = num_vecs / 10;
+    size_ret_result = num_vecs;
 
     pq_float *codeword_nq = new pq_float[size_codeword_nq];
     pq_float *codeword_pq = new pq_float[size_codeword_pq];
@@ -214,7 +278,13 @@ int main(int argc, char *argv[]) {
     pq_float temp_sum = 0, temp_value = 0;
     printf("# Begin reading query\n");
     for (int i = 0; i < num_query; ++i) {
-        for (int j = 0; j < num_dimen; ++j) scanf("%f", &query[cal_2Dcoordinate(i, j, num_dimen)]);
+        temp_sum = 0;
+        for (int j = 0; j < num_dimen; ++j) {
+            scanf("%f", &temp_value);
+            temp_sum += temp_value * temp_value;
+            query[cal_2Dcoordinate(i, j, num_dimen)] = temp_value;
+        }
+        query_norm[i] = sqrt(temp_sum);
     }
 
     int sum_init_correct = 0;
@@ -258,39 +328,72 @@ int main(int argc, char *argv[]) {
     // load data to GPU
     printf("# Begin loading to GPU\n");
     pq_float *device_codeword_pq, *device_codeword_nq, *device_query, *device_lookup_table;
-    int *device_mid_result, *device_ret_result, *device_prefixsum_result;
+    int *device_ret_result, *device_prefixsum_result, *device_mid_result;
     pq_int *device_codebook, *device_q_map;
-    cudaMalloc((pq_float **)&device_codeword_nq, size_codeword_nq);
-    cudaMalloc((pq_float **)&device_codeword_pq, size_codeword_pq);
-    cudaMalloc((pq_int **)&device_codebook, size_codebook);
-    cudaMalloc((pq_float **)&device_query, size_device_query);
-    cudaMalloc((pq_int **)&device_q_map, size_q_map);
-    cudaMalloc((pq_float **)&device_lookup_table, size_lookup_table);
-    cudaMalloc((int **)&device_mid_result, batch_vecs);
-    cudaMalloc((int **)&device_prefixsum_result, batch_vecs);
-    cudaMalloc((int **)&device_ret_result, size_ret_result);
+    cudaMalloc((pq_float **)&device_codeword_nq, size_codeword_nq * sizeof(pq_float));
+    cudaMalloc((pq_float **)&device_codeword_pq, size_codeword_pq * sizeof(pq_float));
+    cudaMalloc((pq_int **)&device_codebook, size_codebook * sizeof(pq_int));
+    cudaMalloc((pq_float **)&device_query, size_device_query * sizeof(pq_float));
+    cudaMalloc((pq_int **)&device_q_map, size_q_map * sizeof(pq_int));
+    cudaMalloc((pq_float **)&device_lookup_table, size_lookup_table * sizeof(pq_float));
+    cudaMalloc((int **)&device_mid_result, batch_vecs * sizeof(int));
+    cudaMalloc((int **)&device_prefixsum_result, batch_vecs * sizeof(int));
+    cudaMalloc((int **)&device_ret_result, size_ret_result * sizeof(int));
 
-    cudaMemcpy(device_codeword_nq, codeword_nq, size_codeword_nq, cudaMemcpyHostToDevice);
-    cudaMemcpy(device_codeword_pq, codeword_pq, size_codeword_pq, cudaMemcpyHostToDevice);
-    cudaMemcpy(device_codebook, codebook, size_codebook, cudaMemcpyHostToDevice);
-    cudaMemcpy(device_q_map, q_map, size_q_map, cudaMemcpyHostToDevice);
+    int *h_mid_result = new int[batch_vecs];
+    int *h_prefixsum_result = new int[batch_vecs];
+    int *h_ret_result = new int[batch_vecs];
+    pq_float *h_lookup_table = new pq_float[size_lookup_table];
+    pq_float *gpuref_lookup_table = new pq_float[size_lookup_table];
+    int *gpuref_mid_result = new int[batch_vecs];
+
+    printf("# Begin copying data\n");
+
+    cudaMemcpy(device_codeword_nq, codeword_nq, size_codeword_nq * sizeof(pq_float), cudaMemcpyHostToDevice);
+    cudaMemcpy(device_codeword_pq, codeword_pq, size_codeword_pq * sizeof(pq_float), cudaMemcpyHostToDevice);
+    cudaMemcpy(device_codebook, codebook, size_codebook * sizeof(pq_int), cudaMemcpyHostToDevice);
+    cudaMemcpy(device_q_map, q_map, size_q_map * sizeof(pq_int), cudaMemcpyHostToDevice);
 
     void *d_temp_storage = NULL;
     size_t temp_storage_bytes = 0;
     cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, device_mid_result, device_prefixsum_result, batch_vecs);
     cudaMalloc(&d_temp_storage, temp_storage_bytes);
 
+    // test lookup table
+    // cudaMemcpy(device_query, query, num_dimen * sizeof(pq_float), cudaMemcpyHostToDevice);
+    // dim3 grid_lookup (num_q);
+    // dim3 block_lookup (Ks);
+    // calLookupOnGPU<<<grid_lookup, block_lookup>>>(device_query, device_codeword_nq, device_codeword_pq, device_q_map, device_lookup_table,
+    //     num_dimen);
+    // cudaDeviceSynchronize();
+    // cudaMemcpy(gpuref_lookup_table, device_lookup_table, size_lookup_table * sizeof(pq_float), cudaMemcpyDeviceToHost);
+    // calLookupOnCPU(query, codeword_nq, codeword_pq, q_map, h_lookup_table, num_dimen, num_q, Ks);
+    // checkLookup(h_lookup_table, gpuref_lookup_table, size_lookup_table);
+
+    // int start_pos = 0, end_pos = batch_vecs;
+    // dim3 grid_prune (batch_vecs / threads_per_block);
+    // dim3 block_prune (threads_per_block);
+    // calApproxVecs<<<grid_prune, block_prune, size_lookup_table * sizeof(pq_float)>>>(device_mid_result, device_codebook, device_lookup_table, device_q_map, 
+    //     num_q, Ks, num_vecs, start_pos, end_pos, threshold[0]);
+    // cudaDeviceSynchronize();
+    // cudaMemcpy(gpuref_mid_result, device_mid_result, batch_vecs * sizeof(pq_float), cudaMemcpyDeviceToHost);
+    // calMidResultOnCPU(h_mid_result, codebook, h_lookup_table, q_map, num_q, Ks, num_vecs, start_pos, end_pos, threshold[0]);
+    // checkMidResult(h_mid_result, gpuref_mid_result, end_pos - start_pos);
+    
+    // end testing lookup table
+
     // int sum_batch_query = (num_query + batch_query - 1) / batch_query;
     int sum_batch_vecs = (num_vecs + batch_vecs - 1) / batch_vecs;
     // vector<int> candidate;
 
-    int sum_final_correct = 0, sum_final_length = 0;
+    int sum_final_correct = 0, sum_final_length = 0, temp_length[2];
 
     clock_t start_time = clock();
-    
+
+    printf("# Begin calculating\n");
     for (int i = 0; i < num_query; ++i) {
         // load the query into gpu
-        cudaMemcpy(device_query, query + i * num_dimen, num_dimen, cudaMemcpyHostToDevice);
+        cudaMemcpy(device_query, query + i * num_dimen, num_dimen * sizeof(pq_float), cudaMemcpyHostToDevice);
         // calculate the lookup table
         dim3 grid_lookup (num_q);
         dim3 block_lookup (Ks);
@@ -301,29 +404,63 @@ int main(int argc, char *argv[]) {
         dim3 grid_prune (batch_vecs / threads_per_block);
         dim3 block_prune (threads_per_block);
 
-        int start_pos = 0, end_pos = batch_vecs, current_length = 0;
+        int start_pos = top_norm, end_pos = top_norm + batch_vecs, current_length = 0;
         float norm_threshold = threshold[i] / query_norm[i];
+
+        // printf("# %dth query threshold is %f", i, norm_threshold);
 
         // dim3 grid_ret (size_ret_result + threads_per_block - 1 / threads_per_block);
         // dim3 block_ret (threads_per_block);
 
         // initResult<<<grid_ret, block_ret>>>(device_ret_result, size_ret_result);
 
+        cudaDeviceSynchronize();
+
+        // if (i == 900) {
+        //     printf("# %d\n", i);
+        // }
+
         for (int j = 0; j < sum_batch_vecs; ++j) {
             if (norm_threshold > norm_filter[j]) break;
-            calApproxVecs<<<grid_prune, block_prune, size_lookup_table>>>(device_mid_result, device_codebook, device_lookup_table, 
+            calApproxVecs<<<grid_prune, block_prune, size_lookup_table * sizeof(int)>>>(device_mid_result, device_codebook, device_lookup_table, 
                 device_q_map, num_q, Ks, num_vecs, start_pos, end_pos, threshold[i]);
+            cudaDeviceSynchronize();
+            // cudaMemcpy(h_mid_result, device_mid_result, batch_vecs * sizeof(int), cudaMemcpyDeviceToHost);
             cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, device_mid_result, device_prefixsum_result, batch_vecs);
-            assignResult<<<grid_prune, block_prune>>>(device_prefixsum_result, device_ret_result, top_norm, start_pos, end_pos, current_length);
-            current_length += device_prefixsum_result[batch_vecs - 1];
+            cudaDeviceSynchronize();
+            // cudaMemcpy(h_prefixsum_result, device_prefixsum_result, batch_vecs * sizeof(int), cudaMemcpyDeviceToHost);
+            assignResult<<<grid_prune, block_prune>>>(device_prefixsum_result, device_ret_result, start_pos, end_pos, current_length);
+            cudaDeviceSynchronize();
+            cudaMemcpy(temp_length, device_prefixsum_result + end_pos - start_pos - 1, sizeof(int), cudaMemcpyDeviceToHost);
+            // cudaMemcpy(h_ret_result, device_prefixsum_result, batch_vecs * sizeof(int), cudaMemcpyDeviceToHost);
+            current_length += temp_length[0];
             start_pos += batch_vecs;
             end_pos += batch_vecs;
             if (end_pos > num_vecs) end_pos = num_vecs;
         } 
-        cudaMemcpy(ret_result, device_ret_result, current_length, cudaMemcpyDeviceToHost);
+        cudaMemcpy(ret_result, device_ret_result, current_length * sizeof(int), cudaMemcpyDeviceToHost);
         for (int j = 0; j < topk; ++j) ret_result[current_length + j] = candidate_init[i][j];
+
+        // bool flag = 0;
+        // for (int j = 0; j < current_length; ++j) {
+        //     if (ret_result[j] >= num_vecs) {
+        //         flag = 1;
+        //         break;
+        //     }
+        // }
+
+        // if (flag) {
+        //     printf("# %dth query outputs wrong with threshold %f!\n", i, threshold[i]);
+        //     for (int j = 0; j < current_length; ++j) {
+        //         printf("%d ", ret_result[j]);
+        //     }
+        //     printf("\n");
+        //     break;
+        // }
+
         current_length += topk;
         sum_final_length += current_length;
+        query_idx = i;
         std::sort(ret_result, ret_result + current_length, cmpIPIndex);
         sum_final_correct += sameIndex(ret_result, answer[i], topk);
     }
@@ -354,6 +491,9 @@ int main(int argc, char *argv[]) {
     delete [] vecs;
     delete [] norm_filter;
     delete [] ret_result;
+    delete [] h_mid_result;
+    delete [] h_prefixsum_result;
+    delete [] h_ret_result;
     for (int i = 0; i < num_query; ++i) delete [] candidate_init[i];
     delete [] candidate_init;
     for (int i = 0; i < num_query; ++i) delete [] answer[i];
