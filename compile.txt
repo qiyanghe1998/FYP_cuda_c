@@ -1,0 +1,4 @@
+nvcc -std=c++11 -g -G -arch sm_50 -O3 main.cu -o main -I ../../reference/cub-1.8.0/
+./main netflix 20 4 256 2 8192 200 256
+python run_index.py --dataset imagenet --topk 20 --metric product --num_codebook 4 --Ks 256 --num_group 2 --run_faiss 0 --top_norm 5 --open_gpu 1
+python run_ground_truth.py --dataset netflix --topk 50 --metric product
