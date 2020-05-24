@@ -99,19 +99,19 @@ __global__ void calApproxVecs(int *mid_result, pq_int *codebook, pq_float *looku
     // init
     if (start_vecs + idx < end_vecs) {
         int q_type = 0;
-        pq_float result = 0, coefficient = 1, result_temp = 0;
+        pq_float result = 0, coefficient = 1; //result_temp = 0;
         for (int i = 0; i < num_q; ++i) {
             q_type = q_map[2 * i];
             if (q_type == 0) {
-                result += result_temp * coefficient;
+                //result += result_temp * coefficient;
                 coefficient = local_lookup_table[i * Ks + codebook[i * num_vecs + (start_vecs + idx)]];
-                result_temp = 0;
+                //result_temp = 0;
             } else if (q_type == 1) {
-                // result += coefficient * local_lookup_table[i * Ks + codebook[i * num_vecs + (start_vecs + idx)]];
-                result_temp += local_lookup_table[i * Ks + codebook[i * num_vecs + (start_vecs + idx)]];
+                result += coefficient * local_lookup_table[i * Ks + codebook[i * num_vecs + (start_vecs + idx)]];
+                //result_temp += local_lookup_table[i * Ks + codebook[i * num_vecs + (start_vecs + idx)]];
             }
         }
-        result += coefficient * result_temp;
+        //result += coefficient * result_temp;
         if (result >= threshold) mid_result[idx] = 1;
         else mid_result[idx] = 0;
         // mid_result[idx] = result;
@@ -333,6 +333,7 @@ int main(int argc, char *argv[]) {
     printf("# Begin reading items\n");
     for (int i = 0; i < num_vecs; ++i) {
         if ((i - top_norm) % batch_vecs == 0 && i >= top_norm) {
+        //if (i % batch_vecs == top_norm) {
             flag = true;
             temp_sum = 0;
         }
@@ -417,15 +418,19 @@ int main(int argc, char *argv[]) {
     long long sum_final_length = 0;
     long long sum_filter_length = 0;
 
-    int batch_print = 1000;
+    int batch_print = 10000;
     double cpu_time = 0;
-    clock_t start_time_cpu = 0;
-    clock_t end_time_cpu = 0;
+    double gpu_cal_time = 0;
+    double gpu_sum_time = 0;
+    double gpu_assign_time = 0;
+    clock_t temp_time_cpu = 0;
+    clock_t temp_time_gpu = 0;
+    // clock_t end_time_cpu = 0;
     printf("# Begin calculating\n");
     query_cnt = 0;
     clock_t start_time = clock();
 
-    while(1) {
+    // while(1) {
         for (int i = 0; i < num_query; ++i) {
             // load the query into gpu
             cudaMemcpy(device_query, query + i * num_dimen, num_dimen * sizeof(pq_float), cudaMemcpyHostToDevice);
@@ -449,7 +454,7 @@ int main(int argc, char *argv[]) {
 
             // initResult<<<grid_ret, block_ret>>>(device_ret_result, size_ret_result);
 
-            cudaDeviceSynchronize();
+            // cudaDeviceSynchronize();
 
             // if (i == 900) {
             //     printf("# %d\n", i);
@@ -460,25 +465,31 @@ int main(int argc, char *argv[]) {
                     sum_filter_length += num_vecs - top_norm - j * batch_vecs;
                     break;
                 }
+                temp_time_gpu = clock();
                 calApproxVecs<<<grid_prune, block_prune, size_lookup_table * sizeof(pq_float)>>>(device_mid_result, device_codebook, device_lookup_table, 
                     device_q_map, num_q, Ks, num_vecs, start_pos, end_pos, threshold[i]);
-                cudaDeviceSynchronize();
+                // cudaDeviceSynchronize();
+                gpu_cal_time += (double)(clock() - temp_time_gpu) / CLOCKS_PER_SEC;
+                temp_time_gpu = clock();
                 // cudaMemcpy(h_mid_result, device_mid_result, batch_vecs * sizeof(int), cudaMemcpyDeviceToHost);
                 cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, device_mid_result, device_prefixsum_result, batch_vecs);
-                cudaDeviceSynchronize();
+                // cudaDeviceSynchronize();
+                gpu_sum_time += (double)(clock() - temp_time_gpu) / CLOCKS_PER_SEC;
+                temp_time_gpu = clock();
                 // cudaMemcpy(h_prefixsum_result, device_prefixsum_result, batch_vecs * sizeof(int), cudaMemcpyDeviceToHost);
                 assignResult<<<grid_prune, block_prune>>>(device_prefixsum_result, device_ret_result, start_pos, end_pos, current_length);
-                cudaDeviceSynchronize();
+                // cudaDeviceSynchronize();
+                gpu_assign_time += (double)(clock() - temp_time_gpu) / CLOCKS_PER_SEC;
                 cudaMemcpy(temp_length, device_prefixsum_result + end_pos - start_pos - 1, sizeof(int), cudaMemcpyDeviceToHost);
                 // cudaMemcpy(h_ret_result, device_prefixsum_result, batch_vecs * sizeof(int), cudaMemcpyDeviceToHost);
                 current_length += temp_length[0];
-                if (current_length >= num_vecs / 10) break;
+                if (current_length >= num_vecs / 20) break;
                 start_pos += batch_vecs;
                 end_pos += batch_vecs;
                 if (end_pos > num_vecs) end_pos = num_vecs;
             } 
             cudaMemcpy(ret_result, device_ret_result, current_length * sizeof(int), cudaMemcpyDeviceToHost);
-            start_time_cpu = clock();
+            temp_time_cpu = clock();
             for (int j = 0; j < topk; ++j) ret_result[current_length + j] = candidate_init[i][j];
 
             // bool flag = 0;
@@ -526,22 +537,25 @@ int main(int argc, char *argv[]) {
             // printf("# length = %d\n", current_length);
             // std::sort(ret_result, ret_result + current_length, cmpIPIndex);
             sum_final_correct += sameIndex(ret_result, answer[i], topk);
-            end_time_cpu = clock();
-            cpu_time += (double)(end_time_cpu - start_time_cpu) / CLOCKS_PER_SEC;
+            // end_time_cpu = clock();
+            cpu_time += (double)(clock() - temp_time_cpu) / CLOCKS_PER_SEC;
             // break;
             if (i % batch_print == batch_print - 1) printf("# %dth query has been processed\n", i);
             query_cnt++;
-            if (query_cnt == 10000) break;
+            //if (query_cnt == 10000) break;
         }
-        if (query_cnt == 10000) break;
-    }
+        //if (query_cnt == 10000) break;
+    //}
 
     clock_t end_time = clock();
-    printf("\n# time spend: %fs\n# top norm faiss time spend: %fs\n# total query: %d\n# recall: %f\n# norm filter length: %f\n# cpu time: %fs", 
-        (double)(end_time - start_time) / CLOCKS_PER_SEC + total_time, total_time, num_query, 
-        sum_final_correct * 1.0 / 10000 / topk, sum_filter_length * 1.0 / 10000, cpu_time);
-    printf("\n# max length: %d\n# init recall: %f\n# total vecs: %d\n# final_length: %f\n", max_length, sum_init_correct * 1.0 / 10000 / topk, num_vecs, 
-        sum_final_length * 1.0 / 10000);    
+
+    double query_processing_time = (double)(end_time - start_time) / CLOCKS_PER_SEC + total_time;
+
+    printf("\n# time spend: %fs\n# top norm faiss time spend: %fs\n# cpu time: %fs\n# gpu cal time: %fs\n# gpu sum time: %fs\n# gpu assign time: %fs", query_processing_time, total_time, cpu_time, gpu_cal_time, gpu_sum_time, gpu_assign_time);
+    printf("\n# total query: %d\n# total vecs: %d\n# norm filter length: %f\n# max length: %d\n# final_length: %f", 
+        num_query, num_vecs, sum_filter_length * 1.0 / num_query, max_length, sum_final_length * 1.0 / num_query);
+    printf("\n# recall: %f\n# init recall: %f\n", sum_final_correct * 1.0 / num_query / topk, 
+        sum_init_correct * 1.0 / num_query / topk);    
 
     // delete all the data
     // printf("# Begin delete gpu array 1!");
