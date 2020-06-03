@@ -19,7 +19,7 @@ int size_codebook;
 int size_query;
 int size_threshold;
 int size_device_query;
-int size_vecs;
+long long size_vecs;
 int size_norm_filter;
 int size_q_map;
 int size_lookup_table;
@@ -35,8 +35,8 @@ std::pair<pq_float, int> *ip_vecs;
 int *ret_result;
 int query_idx;
 
-int cal_2Dcoordinate(int x, int y, int leny) {
-    return x * leny + y;
+long long cal_2Dcoordinate(int x, int y, int leny) {
+    return (long long)x * leny + y;
 }
 
 int cal_3Dcoordinate(int x, int y, int z, int leny, int lenz) {
@@ -272,19 +272,23 @@ int main(int argc, char *argv[]) {
     size_query = num_query * num_dimen;
     size_threshold = num_query;
     size_device_query = num_query * num_dimen;
-    size_vecs = num_vecs * num_dimen;
+    size_vecs = (long long)num_vecs * num_dimen;
     size_norm_filter = num_vecs / batch_vecs;
     size_q_map = num_q * 2;
     size_lookup_table = num_q * Ks;
     size_ret_result = num_vecs;
     size_topnorm_vecs = top_norm * num_dimen;
 
+    vecs = (pq_float *)malloc(size_vecs * sizeof(pq_float));
+    if (!vecs) {
+        printf("\n------malloc failed!!------\n");
+    }
     pq_float *codeword_nq = new pq_float[size_codeword_nq];
     pq_float *codeword_pq = new pq_float[size_codeword_pq];
     pq_int *codebook = new pq_int[size_codebook];
     pq_float *query_norm = new pq_float[num_query];
     pq_float *threshold = new pq_float[size_threshold];
-    vecs = new pq_float[size_vecs];
+    // vecs = (pq_float *)malloc(size_vecs * sizeof(pq_float));
     ret_result = new int[size_ret_result];
     query = new pq_float[size_query];
     norm_ret = new pq_float[size_ret_result];
@@ -461,174 +465,174 @@ int main(int argc, char *argv[]) {
     cudaMemcpy(device_query, query, num_query * num_dimen * sizeof(pq_float), cudaMemcpyHostToDevice);
 
     // while(1) {
-        for (int i = 0; i < num_query; ++i) {
-            // load the query into gpu
-            // temp_time_cpu = clock();
-            
-            // calculate the lookup table
-            dim3 grid_lookup (num_q);
-            dim3 block_lookup (Ks);
+    for (int i = 0; i < num_query; ++i) {
+        // load the query into gpu
+        // temp_time_cpu = clock();
+        
+        // calculate the lookup table
+        dim3 grid_lookup (num_q);
+        dim3 block_lookup (Ks);
 
-            calLookupOnGPU<<<grid_lookup, block_lookup>>>(device_query, device_codeword_nq, device_codeword_pq, device_q_map, 
-                device_lookup_table, num_dimen, i * num_dimen);
-            // calculate the approximate vecs
-            // dim3 grid_prune (batch_vecs / threads_per_block);
-            dim3 block_prune (threads_per_block);
+        calLookupOnGPU<<<grid_lookup, block_lookup>>>(device_query, device_codeword_nq, device_codeword_pq, device_q_map, 
+            device_lookup_table, num_dimen, i * num_dimen);
+        // calculate the approximate vecs
+        // dim3 grid_prune (batch_vecs / threads_per_block);
+        dim3 block_prune (threads_per_block);
 
-            int start_pos = top_norm, end_pos = top_norm + batch_vecs, current_length = 0;
-            double norm_threshold = -threshold[i] / query_norm[i];
+        int start_pos = top_norm, end_pos = top_norm + batch_vecs, current_length = 0;
+        double norm_threshold = -threshold[i] / query_norm[i];
 
-            // printf("# %dth query threshold is %f", i, norm_threshold);
+        // printf("# %dth query threshold is %f", i, norm_threshold);
 
-            // dim3 grid_ret (size_ret_result + threads_per_block - 1 / threads_per_block);
-            // dim3 block_ret (threads_per_block);
+        // dim3 grid_ret (size_ret_result + threads_per_block - 1 / threads_per_block);
+        // dim3 block_ret (threads_per_block);
 
-            // initResult<<<grid_ret, block_ret>>>(device_ret_result, size_ret_result);
+        // initResult<<<grid_ret, block_ret>>>(device_ret_result, size_ret_result);
 
-            
+        
 
-            // binary search for the threshold
+        // binary search for the threshold
 
-            int norm_index_left = 0, norm_index_right = sum_batch_vecs + 1, norm_index_mid = 0;
-            while (norm_index_left < norm_index_right) {
-                norm_index_mid = (norm_index_left + norm_index_right) >> 1;
-                if (norm_threshold <= norm_filter[norm_index_mid]) norm_index_right = norm_index_mid;
-                else norm_index_left = norm_index_mid + 1; 
-            }
-
-            int index_vecs = norm_index_left;
-
-            // int index_vecs = std::lower_bound(norm_filter, norm_filter + sum_batch_vecs + 1, norm_threshold) - norm_filter;
-            cudaDeviceSynchronize();
-            // prepare_time += (double)(clock() - temp_time_cpu) / CLOCKS_PER_SEC;
-
-            // if (i == 900) {
-            //     printf("# %d\n", i);
-            // }
-
-            if (index_vecs > 0) {
-                end_pos = index_vecs * batch_vecs + top_norm;
-                if (end_pos > num_vecs) end_pos = num_vecs;
-                sum_filter_length += num_vecs - end_pos;
-                // temp_time_gpu = clock();
-                dim3 grid_prune ((end_pos - start_pos + threads_per_block - 1) / threads_per_block);
-                calApproxVecs<<<grid_prune, block_prune, size_lookup_table * sizeof(pq_float)>>>(device_mid_result, device_codebook, device_lookup_table, 
-                    device_q_map, num_q, Ks, num_vecs, start_pos, end_pos, threshold[i]);
-                cudaDeviceSynchronize();
-                // gpu_cal_time += (double)(clock() - temp_time_gpu) / CLOCKS_PER_SEC;
-                // temp_time_gpu = clock();
-                // cudaMemcpy(h_mid_result, device_mid_result, batch_vecs * sizeof(int), cudaMemcpyDeviceToHost);
-                cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, device_mid_result, device_prefixsum_result, end_pos - start_pos);
-                cudaDeviceSynchronize();
-                // gpu_sum_time += (double)(clock() - temp_time_gpu) / CLOCKS_PER_SEC;
-                // temp_time_gpu = clock();
-                // cudaMemcpy(h_prefixsum_result, device_prefixsum_result, batch_vecs * sizeof(int), cudaMemcpyDeviceToHost);
-                assignResult<<<grid_prune, block_prune>>>(device_prefixsum_result, device_ret_result, start_pos, end_pos);
-                cudaDeviceSynchronize();
-                // gpu_assign_time += (double)(clock() - temp_time_gpu) / CLOCKS_PER_SEC;
-                cudaMemcpy(temp_length, device_prefixsum_result + end_pos - start_pos - 1, sizeof(int), cudaMemcpyDeviceToHost);
-                // cudaMemcpy(h_ret_result, device_prefixsum_result, batch_vecs * sizeof(int), cudaMemcpyDeviceToHost);
-                current_length += min(temp_length[0], ret_limit);
-                // if (current_length >= num_vecs / 20) break;
-                // start_pos += batch_vecs;
-                // end_pos += batch_vecs;
-                // if (end_pos > num_vecs) end_pos = num_vecs;
-            } 
-
-            // for (int j = 0; j < sum_batch_vecs; ++j) {
-            //     if (norm_threshold > norm_filter[j]) {
-            //         sum_filter_length += num_vecs - top_norm - j * batch_vecs;
-            //         break;
-            //     }
-            //     temp_time_gpu = clock();
-            //     calApproxVecs<<<grid_prune, block_prune, size_lookup_table * sizeof(pq_float)>>>(device_mid_result, device_codebook, device_lookup_table, 
-            //         device_q_map, num_q, Ks, num_vecs, start_pos, end_pos, threshold[i]);
-            //     cudaDeviceSynchronize();
-            //     gpu_cal_time += (double)(clock() - temp_time_gpu) / CLOCKS_PER_SEC;
-            //     temp_time_gpu = clock();
-            //     // cudaMemcpy(h_mid_result, device_mid_result, batch_vecs * sizeof(int), cudaMemcpyDeviceToHost);
-            //     cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, device_mid_result, device_prefixsum_result, batch_vecs);
-            //     cudaDeviceSynchronize();
-            //     gpu_sum_time += (double)(clock() - temp_time_gpu) / CLOCKS_PER_SEC;
-            //     temp_time_gpu = clock();
-            //     // cudaMemcpy(h_prefixsum_result, device_prefixsum_result, batch_vecs * sizeof(int), cudaMemcpyDeviceToHost);
-            //     assignResult2<<<grid_prune, block_prune>>>(device_prefixsum_result, device_ret_result, start_pos, end_pos, current_length);
-            //     cudaDeviceSynchronize();
-            //     gpu_assign_time += (double)(clock() - temp_time_gpu) / CLOCKS_PER_SEC;
-            //     cudaMemcpy(temp_length, device_prefixsum_result + end_pos - start_pos - 1, sizeof(int), cudaMemcpyDeviceToHost);
-            //     // cudaMemcpy(h_ret_result, device_prefixsum_result, batch_vecs * sizeof(int), cudaMemcpyDeviceToHost);
-            //     current_length += temp_length[0];
-            //     if (current_length >= num_vecs / 20) break;
-            //     start_pos += batch_vecs;
-            //     end_pos += batch_vecs;
-            //     if (end_pos > num_vecs) end_pos = num_vecs;
-            // } 
-            // temp_time_gpu = clock();
-            cudaMemcpy(ret_result, device_ret_result, current_length * sizeof(int), cudaMemcpyDeviceToHost);
-            // temp_time_cpu = clock();
-            // copy_back_time += (double)(temp_time_cpu - temp_time_gpu) / CLOCKS_PER_SEC;
-            for (int j = 0; j < topk; ++j) ret_result[current_length + j] = candidate_init[i][j];
-
-            // bool flag = 0;
-            // for (int j = 0; j < current_length; ++j) {
-            //     if (ret_result[j] >= num_vecs) {
-            //         flag = 1;
-            //         break;
-            //     }
-            // }
-
-            // if (flag) {
-            //     printf("# %dth query outputs wrong with threshold %f!\n", i, threshold[i]);
-            //     for (int j = 0; j < current_length; ++j) {
-            //         printf("%d ", ret_result[j]);
-            //     }
-            //     printf("\n");
-            //     break;
-            // }
-
-            current_length += topk;
-
-            // if (current_length >= num_vecs / 2) {
-            //     for (int j = 0; j < sum_batch_vecs; ++j) printf("# %dth norm filter is %f\n", j, norm_filter[j]);
-            //     printf("# %dth query threshold is %f and query norm is %f\n", i, threshold[i], query_norm[i]);
-            //     break;
-            // }
-            
-            max_length = max(max_length, current_length);
-            sum_final_length += current_length;
-            query_idx = i;
-            calIP(ret_result, current_length, ip_vecs, num_dimen);
-            nth_element(ip_vecs, ip_vecs + topk, ip_vecs + current_length);
-            // bool flag = 0;
-            // for (int j = 0; j < topk - 1; ++j) {
-            //     if (-ip_vecs[j].first < -ip_vecs[topk - 1].first) {
-            //         flag = 1;
-            //         break;
-            //     }
-            // }
-
-            // if (flag) {
-            //     printf("# %dth query is wrong\n", i);
-            //     for (int j = 0; j < topk; ++j) {
-            //         printf("# id: %d ip: %f\n", ip_vecs[j].second, ip_vecs[j].first);
-            //     }
-            //     break;
-            // }
-            // for (int j = 0; j < topk; ++j) {
-            //     printf("# id: %d ip: %f\n", ip_vecs[j].second, ip_vecs[j].first);
-            // }
-            for (int j = 0; j < topk; ++j) ret_result[j] = ip_vecs[j].second;
-            // printf("# length = %d\n", current_length);
-            // std::sort(ret_result, ret_result + current_length, cmpIPIndex);
-            sum_final_correct += sameIndex(ret_result, answer[i], topk);
-            // end_time_cpu = clock();
-            // cpu_time += (double)(clock() - temp_time_cpu) / CLOCKS_PER_SEC;
-            // break;
-            // if (i % batch_print == batch_print - 1) printf("# %dth query has been processed\n", i);
-            // query_cnt++;
-            //if (query_cnt == 10000) break;
+        int norm_index_left = 0, norm_index_right = sum_batch_vecs + 1, norm_index_mid = 0;
+        while (norm_index_left < norm_index_right) {
+            norm_index_mid = (norm_index_left + norm_index_right) >> 1;
+            if (norm_threshold <= norm_filter[norm_index_mid]) norm_index_right = norm_index_mid;
+            else norm_index_left = norm_index_mid + 1; 
         }
+
+        int index_vecs = norm_index_left;
+
+        // int index_vecs = std::lower_bound(norm_filter, norm_filter + sum_batch_vecs + 1, norm_threshold) - norm_filter;
+        cudaDeviceSynchronize();
+        // prepare_time += (double)(clock() - temp_time_cpu) / CLOCKS_PER_SEC;
+
+        // if (i == 900) {
+        //     printf("# %d\n", i);
+        // }
+
+        if (index_vecs > 0) {
+            end_pos = index_vecs * batch_vecs + top_norm;
+            if (end_pos > num_vecs) end_pos = num_vecs;
+            sum_filter_length += num_vecs - end_pos;
+            // temp_time_gpu = clock();
+            dim3 grid_prune ((end_pos - start_pos + threads_per_block - 1) / threads_per_block);
+            calApproxVecs<<<grid_prune, block_prune, size_lookup_table * sizeof(pq_float)>>>(device_mid_result, device_codebook, device_lookup_table, 
+                device_q_map, num_q, Ks, num_vecs, start_pos, end_pos, threshold[i]);
+            cudaDeviceSynchronize();
+            // gpu_cal_time += (double)(clock() - temp_time_gpu) / CLOCKS_PER_SEC;
+            // temp_time_gpu = clock();
+            // cudaMemcpy(h_mid_result, device_mid_result, batch_vecs * sizeof(int), cudaMemcpyDeviceToHost);
+            cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, device_mid_result, device_prefixsum_result, end_pos - start_pos);
+            cudaDeviceSynchronize();
+            // gpu_sum_time += (double)(clock() - temp_time_gpu) / CLOCKS_PER_SEC;
+            // temp_time_gpu = clock();
+            // cudaMemcpy(h_prefixsum_result, device_prefixsum_result, batch_vecs * sizeof(int), cudaMemcpyDeviceToHost);
+            assignResult<<<grid_prune, block_prune>>>(device_prefixsum_result, device_ret_result, start_pos, end_pos);
+            cudaDeviceSynchronize();
+            // gpu_assign_time += (double)(clock() - temp_time_gpu) / CLOCKS_PER_SEC;
+            cudaMemcpy(temp_length, device_prefixsum_result + end_pos - start_pos - 1, sizeof(int), cudaMemcpyDeviceToHost);
+            // cudaMemcpy(h_ret_result, device_prefixsum_result, batch_vecs * sizeof(int), cudaMemcpyDeviceToHost);
+            current_length += min(temp_length[0], ret_limit);
+            // if (current_length >= num_vecs / 20) break;
+            // start_pos += batch_vecs;
+            // end_pos += batch_vecs;
+            // if (end_pos > num_vecs) end_pos = num_vecs;
+        } 
+
+        // for (int j = 0; j < sum_batch_vecs; ++j) {
+        //     if (norm_threshold > norm_filter[j]) {
+        //         sum_filter_length += num_vecs - top_norm - j * batch_vecs;
+        //         break;
+        //     }
+        //     temp_time_gpu = clock();
+        //     calApproxVecs<<<grid_prune, block_prune, size_lookup_table * sizeof(pq_float)>>>(device_mid_result, device_codebook, device_lookup_table, 
+        //         device_q_map, num_q, Ks, num_vecs, start_pos, end_pos, threshold[i]);
+        //     cudaDeviceSynchronize();
+        //     gpu_cal_time += (double)(clock() - temp_time_gpu) / CLOCKS_PER_SEC;
+        //     temp_time_gpu = clock();
+        //     // cudaMemcpy(h_mid_result, device_mid_result, batch_vecs * sizeof(int), cudaMemcpyDeviceToHost);
+        //     cub::DeviceScan::InclusiveSum(d_temp_storage, temp_storage_bytes, device_mid_result, device_prefixsum_result, batch_vecs);
+        //     cudaDeviceSynchronize();
+        //     gpu_sum_time += (double)(clock() - temp_time_gpu) / CLOCKS_PER_SEC;
+        //     temp_time_gpu = clock();
+        //     // cudaMemcpy(h_prefixsum_result, device_prefixsum_result, batch_vecs * sizeof(int), cudaMemcpyDeviceToHost);
+        //     assignResult2<<<grid_prune, block_prune>>>(device_prefixsum_result, device_ret_result, start_pos, end_pos, current_length);
+        //     cudaDeviceSynchronize();
+        //     gpu_assign_time += (double)(clock() - temp_time_gpu) / CLOCKS_PER_SEC;
+        //     cudaMemcpy(temp_length, device_prefixsum_result + end_pos - start_pos - 1, sizeof(int), cudaMemcpyDeviceToHost);
+        //     // cudaMemcpy(h_ret_result, device_prefixsum_result, batch_vecs * sizeof(int), cudaMemcpyDeviceToHost);
+        //     current_length += temp_length[0];
+        //     if (current_length >= num_vecs / 20) break;
+        //     start_pos += batch_vecs;
+        //     end_pos += batch_vecs;
+        //     if (end_pos > num_vecs) end_pos = num_vecs;
+        // } 
+        // temp_time_gpu = clock();
+        cudaMemcpy(ret_result, device_ret_result, current_length * sizeof(int), cudaMemcpyDeviceToHost);
+        // temp_time_cpu = clock();
+        // copy_back_time += (double)(temp_time_cpu - temp_time_gpu) / CLOCKS_PER_SEC;
+        for (int j = 0; j < topk; ++j) ret_result[current_length + j] = candidate_init[i][j];
+
+        // bool flag = 0;
+        // for (int j = 0; j < current_length; ++j) {
+        //     if (ret_result[j] >= num_vecs) {
+        //         flag = 1;
+        //         break;
+        //     }
+        // }
+
+        // if (flag) {
+        //     printf("# %dth query outputs wrong with threshold %f!\n", i, threshold[i]);
+        //     for (int j = 0; j < current_length; ++j) {
+        //         printf("%d ", ret_result[j]);
+        //     }
+        //     printf("\n");
+        //     break;
+        // }
+
+        current_length += topk;
+
+        // if (current_length >= num_vecs / 2) {
+        //     for (int j = 0; j < sum_batch_vecs; ++j) printf("# %dth norm filter is %f\n", j, norm_filter[j]);
+        //     printf("# %dth query threshold is %f and query norm is %f\n", i, threshold[i], query_norm[i]);
+        //     break;
+        // }
+        
+        max_length = max(max_length, current_length);
+        sum_final_length += current_length;
+        query_idx = i;
+        calIP(ret_result, current_length, ip_vecs, num_dimen);
+        nth_element(ip_vecs, ip_vecs + topk, ip_vecs + current_length);
+        // bool flag = 0;
+        // for (int j = 0; j < topk - 1; ++j) {
+        //     if (-ip_vecs[j].first < -ip_vecs[topk - 1].first) {
+        //         flag = 1;
+        //         break;
+        //     }
+        // }
+
+        // if (flag) {
+        //     printf("# %dth query is wrong\n", i);
+        //     for (int j = 0; j < topk; ++j) {
+        //         printf("# id: %d ip: %f\n", ip_vecs[j].second, ip_vecs[j].first);
+        //     }
+        //     break;
+        // }
+        // for (int j = 0; j < topk; ++j) {
+        //     printf("# id: %d ip: %f\n", ip_vecs[j].second, ip_vecs[j].first);
+        // }
+        for (int j = 0; j < topk; ++j) ret_result[j] = ip_vecs[j].second;
+        // printf("# length = %d\n", current_length);
+        // std::sort(ret_result, ret_result + current_length, cmpIPIndex);
+        sum_final_correct += sameIndex(ret_result, answer[i], topk);
+        // end_time_cpu = clock();
+        // cpu_time += (double)(clock() - temp_time_cpu) / CLOCKS_PER_SEC;
+        // break;
+        // if (i % batch_print == batch_print - 1) printf("# %dth query has been processed\n", i);
+        // query_cnt++;
         //if (query_cnt == 10000) break;
+    }
+    //if (query_cnt == 10000) break;
     //}
 
     clock_t end_time = clock();
@@ -671,7 +675,7 @@ int main(int argc, char *argv[]) {
     delete [] query;
     delete [] query_norm;
     delete [] threshold;
-    delete [] vecs;
+    free(vecs);
     delete [] norm_filter;
     delete [] ret_result;
     delete [] h_mid_result;
